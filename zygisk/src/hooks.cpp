@@ -49,7 +49,6 @@ const char *spoof_lookup(const char *name) {
     return nullptr;
 }
 
-// ---- proc filtering ----
 bool is_filterable_proc(const char *path) {
     if (!path) return false;
     if (strncmp(path, "/proc/", 6) != 0) return false;
@@ -60,7 +59,6 @@ bool is_filterable_proc(const char *path) {
         if (*p != '/') return false;
         ++p;
     }
-    // task/<tid>/<file>
     if (strncmp(p, "task/", 5) == 0) {
         p += 5;
         while (*p >= '0' && *p <= '9') ++p;
@@ -107,7 +105,6 @@ void filter_status(std::string &s) {
     while (i < s.size()) {
         size_t e = s.find('\n', i);
         if (e == std::string::npos) e = s.size();
-        // ganti TracerPid jadi 0
         if (e - i >= 9 && strncmp(s.data() + i, "TracerPid", 9) == 0) {
             out += "TracerPid:\t0\n";
         } else {
@@ -153,7 +150,6 @@ FILE *make_filtered_stream(const std::string &content, const char *mode) {
     return f;
 }
 
-// ---- originals ----
 int      (*orig_open)(const char *, int, ...)                   = nullptr;
 int      (*orig_openat)(int, const char *, int, ...)            = nullptr;
 int      (*orig_open64)(const char *, int, ...)                 = nullptr;
@@ -178,7 +174,6 @@ int      (*orig_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *),
 void    *(*orig_dlopen)(const char *, int)                      = nullptr;
 void    *(*orig_dlsym)(void *, const char *)                    = nullptr;
 
-// ---- libc hooks ----
 int hook_open(const char *p, int f, ...) {
     if (is_hidden(p)) { errno = ENOENT; return -1; }
     mode_t m = 0;
@@ -254,7 +249,6 @@ FILE *hook_fopen64(const char *p, const char *m) {
     return orig_fopen64(p, m);
 }
 
-// ---- system_property_get ----
 int hook___system_property_get(const char *n, char *v) {
     const char *s = spoof_lookup(n);
     if (s) { strcpy(v, s); return (int)strlen(s); }
@@ -262,13 +256,11 @@ int hook___system_property_get(const char *n, char *v) {
     return orig___system_property_get(n, v);
 }
 
-// ---- system_property_find (hide property existence) ----
 const void *hook___system_property_find(const char *n) {
     if (is_hidden_prop(n)) return nullptr;
     return orig___system_property_find(n);
 }
 
-// ---- system_property_read_callback (modern API) ----
 struct prop_ctx {
     void (*user_cb)(void*, const char*, const char*, unsigned);
     void *user_cookie;
@@ -278,7 +270,7 @@ void prop_inner_cb(void *cookie, const char *name, const char *value, unsigned s
     auto *c = static_cast<prop_ctx*>(cookie);
     const char *spoofed = spoof_lookup(name);
     if (spoofed) { c->user_cb(c->user_cookie, name, spoofed, serial); return; }
-    if (is_hidden_prop(name)) return; // skip entirely
+    if (is_hidden_prop(name)) return;
     c->user_cb(c->user_cookie, name, value, serial);
 }
 
@@ -288,7 +280,6 @@ void hook___system_property_read_callback(const void *pi,
     orig___system_property_read_callback(pi, prop_inner_cb, &c);
 }
 
-// ---- raw syscall() — bypass-proof ----
 long hook_syscall(long number, ...) {
     va_list ap;
     va_start(ap, number);
@@ -306,7 +297,6 @@ long hook_syscall(long number, ...) {
     }
 #ifdef SYS_openat2
     if (number == SYS_openat2) {
-        // struct open_how* is a3; path is a2
         const char *path = (const char*)a2;
         if (is_hidden(path)) { errno = ENOENT; return -1; }
     }
@@ -327,7 +317,6 @@ long hook_syscall(long number, ...) {
     return orig_syscall(number, a1, a2, a3, a4, a5, a6);
 }
 
-// ---- dl_iterate_phdr — hide loaded libs ----
 struct dl_ctx {
     int (*user_cb)(struct dl_phdr_info *, size_t, void *);
     void *user_data;
@@ -344,7 +333,6 @@ int hook_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void 
     return orig_dl_iterate_phdr(dl_inner_cb, &c);
 }
 
-// ---- dlopen / dlsym — block suspicious lookups ----
 void *hook_dlopen(const char *name, int flags) {
     if (name && is_hidden(name)) { errno = ENOENT; return nullptr; }
     return orig_dlopen(name, flags);
@@ -357,14 +345,13 @@ void *hook_dlsym(void *handle, const char *symbol) {
 
 bool g_installed = false;
 
-} // namespace
+}
 
 void install_hooks(zygisk::Api *api) {
     if (g_installed) return;
     g_installed = true;
     if (!api || !api->pltHookRegister) return;
 
-    // cek file debug — kalau ada, log aktif
     if (access("/data/adb/ksu-cloak/debug", F_OK) == 0) g_debug = true;
     LOGI("KSU-Cloak v2 — installing");
 
