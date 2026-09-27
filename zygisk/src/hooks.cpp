@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <link.h>
 #include <string>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -19,8 +20,7 @@
 #include <unistd.h>
 
 #define LOG_TAG "KSUCloak"
-static bool g_debug = false;
-#define LOGI(...) do { if (g_debug) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); } while (0)
+#define LOGI(...) ((void)0)
 
 namespace cloak {
 namespace {
@@ -87,8 +87,9 @@ void filter_maps(std::string &s) {
         if (e == std::string::npos) e = s.size();
         bool hide = false;
         for (const char *kw : kHiddenKeywords) {
-            for (size_t k = i; k + strlen(kw) <= e; ++k) {
-                if (strncasecmp(s.data() + k, kw, strlen(kw)) == 0) { hide = true; break; }
+            size_t n = strlen(kw);
+            for (size_t k = i; k + n <= e; ++k) {
+                if (strncasecmp(s.data() + k, kw, n) == 0) { hide = true; break; }
             }
             if (hide) break;
         }
@@ -117,9 +118,11 @@ void filter_status(std::string &s) {
 
 void filter_cmdline(std::string &s) {
     for (const char *kw : kHiddenKeywords) {
+        size_t klen = strlen(kw);
         size_t pos = 0;
         while ((pos = s.find(kw, pos)) != std::string::npos) {
-            s.replace(pos, strlen(kw), "system");
+            s.replace(pos, klen, "system");
+            pos += 6;
         }
     }
 }
@@ -352,9 +355,6 @@ void install_hooks(zygisk::Api *api) {
     g_installed = true;
     if (!api || !api->pltHookRegister) return;
 
-    if (access("/data/adb/ksu-cloak/debug", F_OK) == 0) g_debug = true;
-    LOGI("KSU-Cloak v2 — installing");
-
     api->pltHookRegister(0,0,"open",    (void*)hook_open,    (void**)&orig_open);
     api->pltHookRegister(0,0,"openat",  (void*)hook_openat,  (void**)&orig_openat);
     api->pltHookRegister(0,0,"open64",  (void*)hook_open64,  (void**)&orig_open64);
@@ -387,7 +387,6 @@ void install_hooks(zygisk::Api *api) {
     api->pltHookRegister(0,0,"dlsym", (void*)hook_dlsym, (void**)&orig_dlsym);
 
     api->pltHookCommit();
-    LOGI("KSU-Cloak v2 — %d hooks committed", 23);
 }
 
 }
