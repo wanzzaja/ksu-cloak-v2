@@ -1,4 +1,3 @@
-```cpp
 #pragma once
 #include <jni.h>
 #include <cstdlib>
@@ -54,4 +53,3 @@ void zygisk_module_entry(zygisk::Api *api, JNIEnv *env) {                   \
     static clazz module; module.onLoad(api, env); }                         \
 extern "C" [[gnu::visibility("default")]] void zygisk_module_ctor() {}      \
 extern "C" [[gnu::visibility("default")]] void zygisk_module_dtor() {}
-```
