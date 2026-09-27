@@ -4,7 +4,7 @@
 #include <cstring>
 
 #define LOG_TAG "KSUCloak"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) ((void)0)
 
 using namespace zygisk;
 
@@ -27,10 +27,7 @@ public:
     void postAppSpecialize(const AppSpecializeArgs *args) override {
         if (!env || !args) return;
         const char *pkg = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (should_hook(pkg)) {
-            LOGI("hooking %s", pkg);
-            cloak::install_hooks(api);
-        }
+        if (should_hook(pkg)) cloak::install_hooks(api);
         if (pkg) env->ReleaseStringUTFChars(args->nice_name, pkg);
     }
     void preServerSpecialize(ServerSpecializeArgs *) override {}
