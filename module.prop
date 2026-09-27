@@ -1,0 +1,6 @@
+id=ksu-cloak
+name=KSU Cloak
+version=2.0.0
+versionCode=2
+author=ANON
+description=Oversized anti-detection stack for KernelSU. Targets TikTok + Shopee native detection vectors.
