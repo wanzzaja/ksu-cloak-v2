@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -13,10 +14,12 @@
 #include <link.h>
 #include <string>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LOG_TAG "KSUCloak"
@@ -51,22 +54,32 @@ const char *spoof_lookup(const char *name) {
 
 bool is_filterable_proc(const char *path) {
     if (!path) return false;
-    if (strncmp(path, "/proc/", 6) != 0) return false;
-    const char *p = path + 6;
+    if (strncmp(path, "/proc/", 6) != 0 && strncmp(path, "/sys/", 5) != 0) return false;
+    const char *p = path + (strncmp(path, "/proc/", 6) == 0 ? 6 : 5);
     if (strncmp(p, "self/", 5) == 0) p += 5;
+    else if (strncmp(p, "class/", 6) == 0) p += 6;
+    else if (strncmp(p, "devices/", 8) == 0) p += 8;
+    else if (strncmp(p, "cpuinfo", 7) == 0) return true;
+    else if (strncmp(p, "version", 7) == 0) return true;
+    else if (strncmp(p, "sys/", 4) == 0) p += 4;
     else {
         while (*p >= '0' && *p <= '9') ++p;
-        if (*p != '/') return false;
-        ++p;
+        if (*p == '/') ++p;
     }
     if (strncmp(p, "task/", 5) == 0) {
         p += 5;
         while (*p >= '0' && *p <= '9') ++p;
-        if (*p != '/') return false;
-        ++p;
+        if (*p == '/') ++p;
     }
     return strcmp(p, "maps") == 0 || strcmp(p, "status") == 0 ||
-           strcmp(p, "cmdline") == 0 || strcmp(p, "comm") == 0;
+           strcmp(p, "cmdline") == 0 || strcmp(p, "comm") == 0 ||
+           strcmp(p, "mountinfo") == 0 || strcmp(p, "mounts") == 0 ||
+           strcmp(p, "cgroup") == 0 || strcmp(p, "version") == 0 ||
+           strcmp(p, "serial_number") == 0 || strcmp(p, "machine") == 0 ||
+           strstr(p, "wlan0/address") || strstr(p, "eth0/address") ||
+           strstr(p, "bt-pan/address") || strstr(p, "iSerial") ||
+           strstr(p, "f_serial/serial") || strstr(p, "boot_id") ||
+           strstr(p, "/proc/cpuinfo");
 }
 
 std::string slurp_fd(int fd) {
@@ -127,14 +140,92 @@ void filter_cmdline(std::string &s) {
     }
 }
 
+void filter_mountinfo(std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t e = s.find('\n', i);
+        if (e == std::string::npos) e = s.size();
+        bool hide = false;
+        for (const char *kw : kHiddenKeywords) {
+            size_t n = strlen(kw);
+            for (size_t k = i; k + n <= e; ++k) {
+                if (strncasecmp(s.data() + k, kw, n) == 0) { hide = true; break; }
+            }
+            if (hide) break;
+        }
+        if (!hide) out.append(s, i, e - i + (e < s.size() ? 1 : 0));
+        i = e + 1;
+    }
+    s.swap(out);
+}
+
+unsigned int xorshift_seed() {
+    static unsigned int s = 0;
+    if (s == 0) s = (unsigned int)time(nullptr) ^ (unsigned int)getpid();
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+
+std::string random_mac() {
+    char buf[18];
+    unsigned int r = xorshift_seed();
+    unsigned int b0 = 0x02;
+    unsigned int b1 = (r >> 8) & 0xFE;
+    unsigned int b2 = (r >> 16) & 0xFF;
+    unsigned int b3 = (r >> 24) & 0xFF;
+    unsigned int b4 = xorshift_seed() & 0xFF;
+    unsigned int b5 = xorshift_seed() & 0xFF;
+    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+             b0, b1, b2, b3, b4, b5);
+    return buf;
+}
+
+std::string random_serial() {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%08X%08X", xorshift_seed(), xorshift_seed());
+    return buf;
+}
+
+void filter_net_mac(std::string &s) { s = random_mac() + "\n"; }
+void filter_serial(std::string &s) { s = random_serial() + "\n"; }
+
+void filter_cpuinfo(std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    std::string serial = random_serial();
+    while (i < s.size()) {
+        size_t e = s.find('\n', i);
+        if (e == std::string::npos) e = s.size();
+        if (e - i > 8 && strncasecmp(s.data() + i, "Serial", 6) == 0) {
+            out += "Serial\t\t: " + serial + "\n";
+        } else if (e - i > 10 && strncasecmp(s.data() + i, "Hardware", 8) == 0) {
+            out += "Hardware\t: Qualcomm Technologies, Inc MSM8998\n";
+        } else {
+            out.append(s, i, e - i + (e < s.size() ? 1 : 0));
+        }
+        i = e + 1;
+    }
+    s.swap(out);
+}
+
 void filter_proc(const char *path, std::string &content) {
     if (strstr(path, "maps")) filter_maps(content);
     else if (strstr(path, "status")) filter_status(content);
     else if (strstr(path, "cmdline")) filter_cmdline(content);
+    else if (strstr(path, "mountinfo") || strstr(path, "mounts")) filter_mountinfo(content);
     else if (strstr(path, "comm")) {
         for (const char *kw : kSuspiciousThreadNames)
             if (strstr(content.c_str(), kw)) { content = "system\n"; break; }
     }
+    else if (strstr(path, "wlan0/address") || strstr(path, "eth0/address") ||
+             strstr(path, "bt-pan/address") || strstr(path, "p2p0/address") ||
+             strstr(path, "dummy0/address")) filter_net_mac(content);
+    else if (strstr(path, "iSerial") || strstr(path, "f_serial") ||
+             strstr(path, "serial_number") || strstr(path, "boot_id")) filter_serial(content);
+    else if (strstr(path, "cpuinfo")) filter_cpuinfo(content);
 }
 
 int make_filtered_fd(const std::string &content) {
@@ -176,6 +267,7 @@ long     (*orig_syscall)(long, ...)                             = nullptr;
 int      (*orig_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
 void    *(*orig_dlopen)(const char *, int)                      = nullptr;
 void    *(*orig_dlsym)(void *, const char *)                    = nullptr;
+int      (*orig_ioctl)(int, unsigned long, ...)                 = nullptr;
 
 int hook_open(const char *p, int f, ...) {
     if (is_hidden(p)) { errno = ENOENT; return -1; }
@@ -304,7 +396,11 @@ long hook_syscall(long number, ...) {
         if (is_hidden(path)) { errno = ENOENT; return -1; }
     }
 #endif
-    if (number == SYS_faccessat || number == SYS_faccessat2) {
+    if (number == SYS_faccessat
+#ifdef SYS_faccessat2
+        || number == SYS_faccessat2
+#endif
+    ) {
         const char *path = (const char*)a2;
         if (is_hidden(path)) { errno = ENOENT; return -1; }
     }
@@ -346,6 +442,14 @@ void *hook_dlsym(void *handle, const char *symbol) {
     return orig_dlsym(handle, symbol);
 }
 
+int hook_ioctl(int fd, unsigned long req, ...) {
+    va_list ap;
+    va_start(ap, req);
+    void *arg = va_arg(ap, void*);
+    va_end(ap);
+    return orig_ioctl(fd, req, arg);
+}
+
 bool g_installed = false;
 
 }
@@ -385,6 +489,7 @@ void install_hooks(zygisk::Api *api) {
         (void*)hook_dl_iterate_phdr,(void**)&orig_dl_iterate_phdr);
     api->pltHookRegister(0,0,"dlopen",(void*)hook_dlopen,(void**)&orig_dlopen);
     api->pltHookRegister(0,0,"dlsym", (void*)hook_dlsym, (void**)&orig_dlsym);
+    api->pltHookRegister(0,0,"ioctl",(void*)hook_ioctl,(void**)&orig_ioctl);
 
     api->pltHookCommit();
 }
