@@ -1,6 +1,6 @@
 id=ksu-cloak
 name=KSU Cloak
-version=3.0.0
-versionCode=3
+version=5.0.0
+versionCode=5
 author=ANON
-description=Overpowered anti-detection + anti-fingerprint stack for KernelSU.
+description=Paranoid Zygisk Cloak v5: smaps, statx, openat2, anti-ptrace, thread-hide.
