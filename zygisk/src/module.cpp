@@ -11,7 +11,7 @@ using namespace zygisk;
 namespace {
 constexpr const char *kTargetPackages[] = {
     "com.shopee.id",
-    "com.ss.android.ugc.trill",
+    "com.zhiliaoapp.musically" // TikTok Target
 };
 bool should_hook(const char *p) {
     if (!p) return false;
