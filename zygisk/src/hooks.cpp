@@ -12,13 +12,17 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
 #include <string>
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -61,6 +65,7 @@ bool is_filterable_proc(const char *path) {
     else if (strncmp(p, "devices/", 8) == 0) p += 8;
     else if (strncmp(p, "cpuinfo", 7) == 0) return true;
     else if (strncmp(p, "version", 7) == 0) return true;
+    else if (strncmp(p, "net/", 4) == 0) return true;
     else if (strncmp(p, "sys/", 4) == 0) p += 4;
     else {
         while (*p >= '0' && *p <= '9') ++p;
@@ -71,10 +76,16 @@ bool is_filterable_proc(const char *path) {
         while (*p >= '0' && *p <= '9') ++p;
         if (*p == '/') ++p;
     }
+    if (strncmp(p, "fd/", 3) == 0) return true;
+
     return strcmp(p, "maps") == 0 || strcmp(p, "status") == 0 ||
            strcmp(p, "cmdline") == 0 || strcmp(p, "comm") == 0 ||
            strcmp(p, "mountinfo") == 0 || strcmp(p, "mounts") == 0 ||
            strcmp(p, "cgroup") == 0 || strcmp(p, "version") == 0 ||
+           strcmp(p, "mem") == 0 || strcmp(p, "tcp") == 0 || strcmp(p, "unix") == 0 ||
+           strcmp(p, "smaps") == 0 || strcmp(p, "smaps_rollup") == 0 ||
+           strcmp(p, "numa_maps") == 0 || strcmp(p, "pagemap") == 0 ||
+           strcmp(p, "syscall") == 0 ||
            strcmp(p, "serial_number") == 0 || strcmp(p, "machine") == 0 ||
            strstr(p, "wlan0/address") || strstr(p, "eth0/address") ||
            strstr(p, "bt-pan/address") || strstr(p, "iSerial") ||
@@ -91,7 +102,7 @@ std::string slurp_fd(int fd) {
     return out;
 }
 
-void filter_maps(std::string &s) {
+void filter_lines(std::string &s) {
     std::string out;
     out.reserve(s.size());
     size_t i = 0;
@@ -100,6 +111,27 @@ void filter_maps(std::string &s) {
         if (e == std::string::npos) e = s.size();
         bool hide = false;
         for (const char *kw : kHiddenKeywords) {
+            size_t n = strlen(kw);
+            for (size_t k = i; k + n <= e; ++k) {
+                if (strncasecmp(s.data() + k, kw, n) == 0) { hide = true; break; }
+            }
+            if (hide) break;
+        }
+        if (!hide) out.append(s, i, e - i + (e < s.size() ? 1 : 0));
+        i = e + 1;
+    }
+    s.swap(out);
+}
+
+void filter_sockets(std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t e = s.find('\n', i);
+        if (e == std::string::npos) e = s.size();
+        bool hide = false;
+        for (const char *kw : kSuspiciousSockets) {
             size_t n = strlen(kw);
             for (size_t k = i; k + n <= e; ++k) {
                 if (strncasecmp(s.data() + k, kw, n) == 0) { hide = true; break; }
@@ -121,88 +153,8 @@ void filter_status(std::string &s) {
         if (e == std::string::npos) e = s.size();
         if (e - i >= 9 && strncmp(s.data() + i, "TracerPid", 9) == 0) {
             out += "TracerPid:\t0\n";
-        } else {
-            out.append(s, i, e - i + (e < s.size() ? 1 : 0));
-        }
-        i = e + 1;
-    }
-    s.swap(out);
-}
-
-void filter_cmdline(std::string &s) {
-    for (const char *kw : kHiddenKeywords) {
-        size_t klen = strlen(kw);
-        size_t pos = 0;
-        while ((pos = s.find(kw, pos)) != std::string::npos) {
-            s.replace(pos, klen, "system");
-            pos += 6;
-        }
-    }
-}
-
-void filter_mountinfo(std::string &s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        size_t e = s.find('\n', i);
-        if (e == std::string::npos) e = s.size();
-        bool hide = false;
-        for (const char *kw : kHiddenKeywords) {
-            size_t n = strlen(kw);
-            for (size_t k = i; k + n <= e; ++k) {
-                if (strncasecmp(s.data() + k, kw, n) == 0) { hide = true; break; }
-            }
-            if (hide) break;
-        }
-        if (!hide) out.append(s, i, e - i + (e < s.size() ? 1 : 0));
-        i = e + 1;
-    }
-    s.swap(out);
-}
-
-unsigned int xorshift_seed() {
-    static unsigned int s = 0;
-    if (s == 0) s = (unsigned int)time(nullptr) ^ (unsigned int)getpid();
-    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-    return s;
-}
-
-std::string random_mac() {
-    char buf[18];
-    unsigned int r = xorshift_seed();
-    unsigned int b0 = 0x02;
-    unsigned int b1 = (r >> 8) & 0xFE;
-    unsigned int b2 = (r >> 16) & 0xFF;
-    unsigned int b3 = (r >> 24) & 0xFF;
-    unsigned int b4 = xorshift_seed() & 0xFF;
-    unsigned int b5 = xorshift_seed() & 0xFF;
-    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
-             b0, b1, b2, b3, b4, b5);
-    return buf;
-}
-
-std::string random_serial() {
-    char buf[20];
-    snprintf(buf, sizeof(buf), "%08X%08X", xorshift_seed(), xorshift_seed());
-    return buf;
-}
-
-void filter_net_mac(std::string &s) { s = random_mac() + "\n"; }
-void filter_serial(std::string &s) { s = random_serial() + "\n"; }
-
-void filter_cpuinfo(std::string &s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    std::string serial = random_serial();
-    while (i < s.size()) {
-        size_t e = s.find('\n', i);
-        if (e == std::string::npos) e = s.size();
-        if (e - i > 8 && strncasecmp(s.data() + i, "Serial", 6) == 0) {
-            out += "Serial\t\t: " + serial + "\n";
-        } else if (e - i > 10 && strncasecmp(s.data() + i, "Hardware", 8) == 0) {
-            out += "Hardware\t: Qualcomm Technologies, Inc MSM8998\n";
+        } else if (e - i >= 5 && strncmp(s.data() + i, "Name:", 5) == 0) {
+            out += "Name:\t" + std::string(kSafeThreadName) + "\n";
         } else {
             out.append(s, i, e - i + (e < s.size() ? 1 : 0));
         }
@@ -212,20 +164,27 @@ void filter_cpuinfo(std::string &s) {
 }
 
 void filter_proc(const char *path, std::string &content) {
-    if (strstr(path, "maps")) filter_maps(content);
-    else if (strstr(path, "status")) filter_status(content);
-    else if (strstr(path, "cmdline")) filter_cmdline(content);
-    else if (strstr(path, "mountinfo") || strstr(path, "mounts")) filter_mountinfo(content);
-    else if (strstr(path, "comm")) {
+    if (strstr(path, "maps") || strstr(path, "mountinfo") || strstr(path, "mounts") ||
+        strstr(path, "smaps") || strstr(path, "smaps_rollup") ||
+        strstr(path, "numa_maps") || strstr(path, "pagemap")) {
+        filter_lines(content);
+    } else if (strstr(path, "status")) {
+        filter_status(content);
+    } else if (strstr(path, "tcp") || strstr(path, "unix")) {
+        filter_sockets(content);
+    } else if (strstr(path, "cmdline")) {
+        for (const char *kw : kHiddenKeywords) {
+            size_t klen = strlen(kw);
+            size_t pos = 0;
+            while ((pos = content.find(kw, pos)) != std::string::npos) {
+                content.replace(pos, klen, "system");
+                pos += 6;
+            }
+        }
+    } else if (strstr(path, "comm")) {
         for (const char *kw : kSuspiciousThreadNames)
-            if (strstr(content.c_str(), kw)) { content = "system\n"; break; }
+            if (strstr(content.c_str(), kw)) { content = std::string(kSafeThreadName) + "\n"; break; }
     }
-    else if (strstr(path, "wlan0/address") || strstr(path, "eth0/address") ||
-             strstr(path, "bt-pan/address") || strstr(path, "p2p0/address") ||
-             strstr(path, "dummy0/address")) filter_net_mac(content);
-    else if (strstr(path, "iSerial") || strstr(path, "f_serial") ||
-             strstr(path, "serial_number") || strstr(path, "boot_id")) filter_serial(content);
-    else if (strstr(path, "cpuinfo")) filter_cpuinfo(content);
 }
 
 int make_filtered_fd(const std::string &content) {
@@ -268,6 +227,13 @@ int      (*orig_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *),
 void    *(*orig_dlopen)(const char *, int)                      = nullptr;
 void    *(*orig_dlsym)(void *, const char *)                    = nullptr;
 int      (*orig_ioctl)(int, unsigned long, ...)                 = nullptr;
+int      (*orig_pthread_setname_np)(pthread_t, const char *)    = nullptr;
+int      (*orig_prctl)(int, unsigned long, unsigned long, unsigned long, unsigned long) = nullptr;
+long     (*orig_ptrace)(int, pid_t, void *, void *)             = nullptr;
+ssize_t  (*orig_process_vm_readv)(pid_t, const struct iovec *, unsigned long, const struct iovec *, unsigned long, unsigned long) = nullptr;
+ssize_t  (*orig_process_vm_writev)(pid_t, const struct iovec *, unsigned long, const struct iovec *, unsigned long, unsigned long) = nullptr;
+int      (*orig_statx)(int, const char *, int, unsigned int, struct statx *) = nullptr;
+ssize_t  (*orig_getdents64)(int, void *, size_t)                 = nullptr;
 
 int hook_open(const char *p, int f, ...) {
     if (is_hidden(p)) { errno = ENOENT; return -1; }
@@ -320,8 +286,31 @@ int hook_lstat(const char *p, struct stat *b) { if (is_hidden(p)) { errno=ENOENT
 int hook_fstatat(int d, const char *p, struct stat *b, int f) { if (is_hidden(p)) { errno=ENOENT; return -1; } return orig_fstatat(d,p,b,f); }
 int hook_access(const char *p, int m) { if (is_hidden(p)) { errno=ENOENT; return -1; } return orig_access(p,m); }
 int hook_faccessat(int d, const char *p, int m, int f) { if (is_hidden(p)) { errno=ENOENT; return -1; } return orig_faccessat(d,p,m,f); }
-ssize_t hook_readlink(const char *p, char *b, size_t s) { if (is_hidden(p)) { errno=ENOENT; return -1; } return orig_readlink(p,b,s); }
-ssize_t hook_readlinkat(int d, const char *p, char *b, size_t s) { if (is_hidden(p)) { errno=ENOENT; return -1; } return orig_readlinkat(d,p,b,s); }
+
+ssize_t hook_readlink(const char *p, char *b, size_t s) {
+    if (is_hidden(p)) { errno = ENOENT; return -1; }
+    ssize_t res = orig_readlink(p, b, s);
+    if (res > 0 && strstr(p, "/proc/self/fd/")) {
+        if (is_hidden(b) || strstr(b, "memfd:") || strstr(b, "jit-cache")) {
+            strncpy(b, "/dev/null", s);
+            return strlen(b);
+        }
+    }
+    return res;
+}
+
+ssize_t hook_readlinkat(int d, const char *p, char *b, size_t s) {
+    if (is_hidden(p)) { errno = ENOENT; return -1; }
+    ssize_t res = orig_readlinkat(d, p, b, s);
+    if (res > 0 && strstr(p, "/proc/self/fd/")) {
+        if (is_hidden(b) || strstr(b, "memfd:") || strstr(b, "jit-cache")) {
+            strncpy(b, "/dev/null", s);
+            return strlen(b);
+        }
+    }
+    return res;
+}
+
 DIR *hook_opendir(const char *p) { if (is_hidden(p)) { errno=ENOENT; return nullptr; } return orig_opendir(p); }
 
 FILE *hook_fopen(const char *p, const char *m) {
@@ -376,39 +365,16 @@ void hook___system_property_read_callback(const void *pi,
 }
 
 long hook_syscall(long number, ...) {
-    va_list ap;
-    va_start(ap, number);
-    long a1 = va_arg(ap, long);
-    long a2 = va_arg(ap, long);
-    long a3 = va_arg(ap, long);
-    long a4 = va_arg(ap, long);
-    long a5 = va_arg(ap, long);
-    long a6 = va_arg(ap, long);
+    va_list ap; va_start(ap, number);
+    long a1 = va_arg(ap, long); long a2 = va_arg(ap, long); long a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long); long a5 = va_arg(ap, long); long a6 = va_arg(ap, long);
     va_end(ap);
 
-    if (number == SYS_openat) {
-        const char *path = (const char*)a2;
-        if (is_hidden(path)) { errno = ENOENT; return -1; }
-    }
+    if (number == SYS_openat || number == SYS_readlinkat || number == SYS_newfstatat
 #ifdef SYS_openat2
-    if (number == SYS_openat2) {
-        const char *path = (const char*)a2;
-        if (is_hidden(path)) { errno = ENOENT; return -1; }
-    }
-#endif
-    if (number == SYS_faccessat
-#ifdef SYS_faccessat2
-        || number == SYS_faccessat2
+        || number == SYS_openat2
 #endif
     ) {
-        const char *path = (const char*)a2;
-        if (is_hidden(path)) { errno = ENOENT; return -1; }
-    }
-    if (number == SYS_readlinkat) {
-        const char *path = (const char*)a2;
-        if (is_hidden(path)) { errno = ENOENT; return -1; }
-    }
-    if (number == SYS_newfstatat) {
         const char *path = (const char*)a2;
         if (is_hidden(path)) { errno = ENOENT; return -1; }
     }
@@ -443,11 +409,66 @@ void *hook_dlsym(void *handle, const char *symbol) {
 }
 
 int hook_ioctl(int fd, unsigned long req, ...) {
-    va_list ap;
-    va_start(ap, req);
-    void *arg = va_arg(ap, void*);
-    va_end(ap);
+    va_list ap; va_start(ap, req); void *arg = va_arg(ap, void*); va_end(ap);
     return orig_ioctl(fd, req, arg);
+}
+
+int hook_pthread_setname_np(pthread_t thread, const char *name) {
+    if (name) {
+        for (const char *kw : kSuspiciousThreadNames) {
+            if (strstr(name, kw)) return orig_pthread_setname_np(thread, kSafeThreadName);
+        }
+    }
+    return orig_pthread_setname_np(thread, name);
+}
+
+int hook_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
+    if (option == PR_SET_NAME && arg2 != 0) {
+        const char *name = (const char*)arg2;
+        for (const char *kw : kSuspiciousThreadNames) {
+            if (strstr(name, kw)) {
+                return orig_prctl(PR_SET_NAME, (unsigned long)kSafeThreadName, 0, 0, 0);
+            }
+        }
+    }
+    if (option == PR_SET_DUMPABLE) {
+        return orig_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+    return orig_prctl(option, arg2, arg3, arg4, arg5);
+}
+
+long hook_ptrace(int request, pid_t pid, void *addr, void *data) {
+    if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
+        errno = EPERM;
+        return -1;
+    }
+    if (request == PTRACE_TRACEME) {
+        return 0;
+    }
+    return orig_ptrace(request, pid, addr, data);
+}
+
+ssize_t hook_process_vm_readv(pid_t pid, const struct iovec *local, unsigned long liovcnt,
+                              const struct iovec *remote, unsigned long riovcnt,
+                              unsigned long flags) {
+    if (pid != getpid()) { errno = EPERM; return -1; }
+    return orig_process_vm_readv(pid, local, liovcnt, remote, riovcnt, flags);
+}
+
+ssize_t hook_process_vm_writev(pid_t pid, const struct iovec *local, unsigned long liovcnt,
+                               const struct iovec *remote, unsigned long riovcnt,
+                               unsigned long flags) {
+    if (pid != getpid()) { errno = EPERM; return -1; }
+    return orig_process_vm_writev(pid, local, liovcnt, remote, riovcnt, flags);
+}
+
+int hook_statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf) {
+    if (is_hidden(pathname)) { errno = ENOENT; return -1; }
+    return orig_statx(dirfd, pathname, flags, mask, statxbuf);
+}
+
+ssize_t hook_getdents64(int fd, void *dirp, size_t count) {
+    return orig_getdents64(fd, dirp, count);
 }
 
 bool g_installed = false;
@@ -485,11 +506,20 @@ void install_hooks(zygisk::Api *api) {
         (void**)&orig___system_property_read_callback);
 
     api->pltHookRegister(0,0,"syscall",(void*)hook_syscall,(void**)&orig_syscall);
-    api->pltHookRegister(0,0,"dl_iterate_phdr",
-        (void*)hook_dl_iterate_phdr,(void**)&orig_dl_iterate_phdr);
+    api->pltHookRegister(0,0,"ioctl",(void*)hook_ioctl,(void**)&orig_ioctl);
+    
+    // Anti-crash TikTok: Comment out 3 lines below if TikTok force closes
+    api->pltHookRegister(0,0,"dl_iterate_phdr", (void*)hook_dl_iterate_phdr,(void**)&orig_dl_iterate_phdr);
     api->pltHookRegister(0,0,"dlopen",(void*)hook_dlopen,(void**)&orig_dlopen);
     api->pltHookRegister(0,0,"dlsym", (void*)hook_dlsym, (void**)&orig_dlsym);
-    api->pltHookRegister(0,0,"ioctl",(void*)hook_ioctl,(void**)&orig_ioctl);
+
+    api->pltHookRegister(0,0,"pthread_setname_np",(void*)hook_pthread_setname_np,(void**)&orig_pthread_setname_np);
+    api->pltHookRegister(0,0,"prctl",(void*)hook_prctl,(void**)&orig_prctl);
+    api->pltHookRegister(0,0,"ptrace",(void*)hook_ptrace,(void**)&orig_ptrace);
+    api->pltHookRegister(0,0,"process_vm_readv",(void*)hook_process_vm_readv,(void**)&orig_process_vm_readv);
+    api->pltHookRegister(0,0,"process_vm_writev",(void*)hook_process_vm_writev,(void**)&orig_process_vm_writev);
+    api->pltHookRegister(0,0,"statx",(void*)hook_statx,(void**)&orig_statx);
+    api->pltHookRegister(0,0,"getdents64",(void*)hook_getdents64,(void**)&orig_getdents64);
 
     api->pltHookCommit();
 }
